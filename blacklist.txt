@@ -1,0 +1,39 @@
+# Brand/character names to flag in KDP metadata
+# One entry per line; lines starting with # are ignored; case-insensitive matching
+disney
+pixar
+marvel
+dc comics
+batman
+superman
+spiderman
+spider-man
+ironman
+iron man
+frozen
+elsa
+moana
+pokemon
+pikachu
+mario
+luigi
+zelda
+minecraft
+fortnite
+roblox
+sonic
+barbie
+hello kitty
+bluey
+peppa
+paw patrol
+cocomelon
+sesame street
+mickey mouse
+winnie the pooh
+dora
+spongebob
+my little pony
+looney tunes
+scooby doo
+thomas the train
