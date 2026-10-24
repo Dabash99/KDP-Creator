@@ -87,8 +87,13 @@ def validate(book: KDPBook, n_ideas: int, script_dir: Path) -> list[str]:
     for i, kw in enumerate(book.keywords, 1):
         _check_text(f"Keyword {i}", kw)
 
-    # Page count in title/subtitle vs actual
-    m = re.search(r"\b(\d+)\b", book.book_title + " " + book.subtitle)
+    # Page count in title/subtitle vs actual.
+    # Strip age-range tokens first (e.g. "Ages 1-3", "1-3") so they are never
+    # mistaken for a page count.
+    title_sub = book.book_title + " " + book.subtitle
+    title_for_count = re.sub(r'\bages?\s+\d+\s*[-–]\s*\d+\b', '', title_sub, flags=re.IGNORECASE)
+    title_for_count = re.sub(r'\b\d+\s*[-–]\s*\d+\b', '', title_for_count)
+    m = re.search(r"\b(\d+)\b", title_for_count)
     if m:
         promised = int(m.group(1))
         if promised != n_ideas:

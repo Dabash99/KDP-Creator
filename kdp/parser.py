@@ -1,4 +1,9 @@
-"""Parse a KDP coloring-book Markdown file into a structured KDPBook object."""
+"""Parse a KDP coloring-book Markdown file into a structured KDPBook object.
+
+Supports book files whose headings are in Arabic and/or English and whose
+KDP form fields are written as a Markdown table (`| Field | Value |`).
+Section matching is keyword based (case-insensitive substring of the heading).
+"""
 from __future__ import annotations
 
 import re
@@ -65,48 +70,66 @@ class KDPBook:
     pricing_notes: str = ""
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Low-level helpers ─────────────────────────────────────────────────────────
+
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_FENCE_SPAN_RE = re.compile(r"```.*?```", re.DOTALL)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_ARABIC_RE = re.compile(r"[؀-ۿ]")
+
 
 def _code_block(text: str) -> Optional[str]:
     """Return content of the first fenced code block, or None."""
-    m = re.search(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+    m = _FENCE_RE.search(text)
     return m.group(1).strip() if m else None
 
 
-def _heading_re(keyword: str) -> re.Pattern:
-    """Regex that matches a heading line containing *keyword* (case-insensitive)."""
-    return re.compile(
-        r"^(#{1,6})\s.*" + re.escape(keyword) + r".*$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-
-
-def _section(text: str, *keywords: str) -> Optional[str]:
-    """
-    Return the text content of the first heading that contains any of *keywords*.
-    Content runs until the next heading at the same or higher level (fewer/equal #).
-    """
-    for kw in keywords:
-        m = _heading_re(kw).search(text)
-        if not m:
+def _headings(text: str) -> list[tuple[int, str, int, int]]:
+    """All headings outside fenced code blocks as (level, title, start, end_of_line)."""
+    spans = [(m.start(), m.end()) for m in _FENCE_SPAN_RE.finditer(text)]
+    out: list[tuple[int, str, int, int]] = []
+    for m in _HEADING_RE.finditer(text):
+        if any(s <= m.start() < e for s, e in spans):
             continue
-        level = len(m.group(1))
-        start = m.end()
-        # Next heading at same or higher level
-        next_h = re.compile(r"^#{1," + str(level) + r"}\s", re.MULTILINE)
-        nm = next_h.search(text, start)
-        return text[start : nm.start() if nm else len(text)]
+        out.append((len(m.group(1)), m.group(2).strip(), m.start(), m.end()))
+    return out
+
+
+def _section(
+    text: str,
+    *keywords: str,
+    min_level: int = 1,
+    max_level: int = 6,
+) -> Optional[str]:
+    """Body of the first heading whose title contains one of *keywords*.
+
+    Keywords are tried in order (case-insensitive substring match, any language).
+    The body runs until the next heading of the same or a higher level.
+    Only headings with min_level <= level <= max_level are considered.
+    """
+    heads = _headings(text)
+    for kw in keywords:
+        kw_l = kw.lower()
+        for i, (level, title, _start, end) in enumerate(heads):
+            if not (min_level <= level <= max_level):
+                continue
+            if kw_l not in title.lower():
+                continue
+            stop = len(text)
+            for lvl2, _t2, start2, _e2 in heads[i + 1:]:
+                if lvl2 <= level:
+                    stop = start2
+                    break
+            return text[end:stop]
     return None
 
 
 def _field(text: str, *patterns: str) -> str:
-    """Extract a key: value field from *text*, anchored to line starts to avoid
-    matching words mid-sentence (e.g. 'bleed' inside a description HTML tag)."""
+    """Legacy `key: value` extractor, anchored to line starts."""
     for pat in patterns:
-        # Wrap in (?:...) so that | inside *pat* doesn't split the surrounding prefix/suffix
         safe = f"(?:{pat})"
         m = re.search(
-            r"^[ \t]*\*{0,2}" + safe + r"\*{0,2}[ \t]*[:\-][ \t]*(.+?)[ \t]*$",
+            r"^[ \t]*[-*]?[ \t]*\*{0,2}" + safe + r"\*{0,2}[ \t]*[:\-][ \t]*(.+?)[ \t]*$",
             text,
             re.IGNORECASE | re.MULTILINE,
         )
@@ -115,15 +138,97 @@ def _field(text: str, *patterns: str) -> str:
     return ""
 
 
+def _inline(text: str, label: str) -> str:
+    """Value of `Label: value` that may sit inside a line separated by `|`."""
+    m = re.search(
+        r"(?:^|[|\s\-*])" + re.escape(label) + r"[ \t]*:[ \t]*([^|\n]+)",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    return m.group(1).strip().strip("`*").strip() if m else ""
+
+
+def _table_rows(text: str) -> dict[str, str]:
+    """Parse Markdown table rows into {lowercase first cell: second+ cells}."""
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        if all(re.fullmatch(r":?-{2,}:?", c) or c == "" for c in cells):
+            continue  # separator row
+        key = cells[0].strip("` *").lower()
+        if key in ("الحقل", "field", "name", ""):
+            continue  # header row
+        rows[key] = " | ".join(cells[1:]).strip()
+    return rows
+
+
+def _clean_value(value: str) -> str:
+    """Strip backticks/bold; treat placeholder notes as empty."""
+    v = value.strip().strip("`").strip("*").strip()
+    low = v.lower()
+    if v.startswith("فاضي") or low in ("empty", "none", "n/a", "-"):
+        return ""
+    if v.startswith("حسب قرار"):  # "per the author's decision" -> not set (use --author)
+        return ""
+    return v
+
+
+def _get(table: dict[str, str], text: str, keys: tuple[str, ...], legacy: tuple[str, ...]) -> str:
+    """Look up a field in the table (key prefix match), else fall back to `key: value`."""
+    for k in keys:
+        k = k.lower()
+        for tk, tv in table.items():
+            if tk == k or tk.startswith(k):
+                return _clean_value(tv)
+    return _clean_value(_field(text, *legacy)) if legacy else ""
+
+
+def _numbered_items(text: str) -> list[tuple[int, str]]:
+    return [
+        (int(n), t.strip())
+        for n, t in re.findall(r"^[ \t]*(\d+)[.)][ \t]+(.+?)[ \t]*$", text, re.MULTILINE)
+    ]
+
+
+def _strip_ticks(s: str) -> str:
+    return s.strip().strip("`").strip()
+
+
+def _first_long_numbered_list(text: str, min_items: int = 10) -> list[tuple[int, str]]:
+    """Fallback: first run of consecutive numbered items with at least min_items entries."""
+    no_fences = _FENCE_SPAN_RE.sub("", text)
+    run: list[tuple[int, str]] = []
+    for line in no_fences.splitlines():
+        m = re.match(r"^[ \t]*(\d+)[.)][ \t]+(.+?)[ \t]*$", line)
+        if m:
+            run.append((int(m.group(1)), m.group(2).strip()))
+        elif line.strip() == "":
+            continue
+        else:
+            if len(run) >= min_items:
+                return run
+            run = []
+    return run if len(run) >= min_items else []
+
+
+def _heading_titles(text: str) -> list[str]:
+    return [("  " * (lvl - 1)) + "#" * lvl + " " + title for lvl, title, _s, _e in _headings(text)]
+
+
 # ── Main parser ───────────────────────────────────────────────────────────────
 
 def parse_book(md_path: Path) -> KDPBook:
     """Parse *md_path* and return a :class:`KDPBook`.  Raises ``ValueError`` on errors."""
-    text = md_path.read_text(encoding="utf-8")
+    text = Path(md_path).read_text(encoding="utf-8")
     errors: list[str] = []
 
     # ── 1. Master style prompt ────────────────────────────────────────────────
-    style_sec = _section(text, "master style prompt", "style prompt", "style guide")
+    style_sec = _section(text, "master style prompt", "master style", "style prompt", "style guide")
     if style_sec is None:
         errors.append("Section not found: 'Master Style Prompt'")
         master_style = ""
@@ -133,135 +238,161 @@ def parse_book(md_path: Path) -> KDPBook:
             errors.append("No fenced code block found inside 'Master Style Prompt'")
             master_style = style_sec.strip()
         else:
-            # Drop the "Reply Ready" paragraph at the end (API calls are stateless)
+            # Drop the "Reply Ready" paragraph (API calls are stateless)
             master_style = re.sub(
-                r'\n\nReply\s*["“]?Ready["”]?.*$',
+                r"\n[ \t]*\n[ \t]*Reply\s*[\"“”']?Ready[\"“”']?.*$",
                 "",
                 raw_code,
                 flags=re.IGNORECASE | re.DOTALL,
             ).strip()
 
     # ── 2. Page ideas ─────────────────────────────────────────────────────────
-    ideas_sec = _section(text, "page ideas", "coloring pages", "page list", "pages")
-    if ideas_sec is None:
-        errors.append("Section not found: 'Page Ideas'")
-        page_ideas: list[PageIdea] = []
-    else:
-        raw_ideas = re.findall(r"^\s*(\d+)[.)]\s+(.+)$", ideas_sec, re.MULTILINE)
-        if not raw_ideas:
-            errors.append("No numbered list found inside the page-ideas section")
-            page_ideas = []
-        else:
-            page_ideas = [PageIdea(number=int(n), idea=t.strip()) for n, t in raw_ideas]
+    ideas_sec = _section(
+        text, "page ideas", "فكرة", "أفكار", "افكار", "ideas", "coloring pages", "page list"
+    )
+    raw_ideas = _numbered_items(ideas_sec) if ideas_sec is not None else []
+    if not raw_ideas:
+        raw_ideas = _first_long_numbered_list(text, 10)
+    if not raw_ideas:
+        errors.append("No page ideas found (looked for a heading with 'فكرة'/'أفكار'/'ideas' "
+                      "containing a numbered list)")
+    page_ideas = [PageIdea(number=n, idea=t) for n, t in raw_ideas]
 
     # ── 3. Cover prompts ──────────────────────────────────────────────────────
-    cover_sec = _section(text, "cover")
+    cover_sec = _section(text, "غلاف", "cover", max_level=2)
+    front_prompt = back_prompt = sample_prompt = ""
     if cover_sec is None:
-        errors.append("Section not found: 'Cover'")
-        front_prompt = back_prompt = sample_prompt = ""
+        errors.append("Section not found: cover section (heading containing 'غلاف' or 'cover')")
     else:
-        # Sub-sections
-        front_sec = _section(cover_sec, "front cover", "front")
-        back_sec  = _section(cover_sec, "back cover", "back")
-        samp_sec  = _section(cover_sec, "colored sample", "colour sample", "sample")
+        front_sec = _section(cover_sec, "front cover", "وش الغلاف", "front", min_level=3)
+        back_sec = _section(cover_sec, "back cover", "ضهر الغلاف", "back", min_level=3)
+        samp_sec = _section(cover_sec, "colored sample", "colour sample", "عينات", "sample",
+                            min_level=3)
 
-        # Fallback: collect all code blocks in order
-        all_blocks = re.findall(r"```[^\n]*\n(.*?)```", cover_sec, re.DOTALL)
-        all_blocks = [b.strip() for b in all_blocks]
+        def _prompt(sec: Optional[str]) -> str:
+            return (_code_block(sec) or "") if sec else ""
 
-        def _cover_prompt(sec: Optional[str], fallback_idx: int) -> str:
-            if sec:
-                cb = _code_block(sec)
-                if cb:
-                    return cb
-            return all_blocks[fallback_idx] if len(all_blocks) > fallback_idx else ""
+        front_prompt = _prompt(front_sec)
+        back_prompt = _prompt(back_sec)
+        sample_prompt = _prompt(samp_sec)
 
-        front_prompt  = _cover_prompt(front_sec, 0)
-        back_prompt   = _cover_prompt(back_sec,  1)
-        sample_prompt = _cover_prompt(samp_sec,  2)
+        # Fallback: when sub-sections are absent, use ordered code blocks in the cover section
+        if not (front_prompt and back_prompt and sample_prompt):
+            all_blocks = [m.group(1).strip() for m in _FENCE_RE.finditer(cover_sec)]
+            if not front_prompt and len(all_blocks) > 0:
+                front_prompt = all_blocks[0]
+            if not back_prompt and len(all_blocks) > 1:
+                back_prompt = all_blocks[1]
+            if not sample_prompt and len(all_blocks) > 2:
+                sample_prompt = all_blocks[2]
 
         if not front_prompt:
-            errors.append("Missing front cover prompt (no code block found)")
+            errors.append("Missing front cover prompt (sub-heading 'وش الغلاف'/'front' with a code block)")
         if not back_prompt:
-            errors.append("Missing back cover prompt (no code block found)")
+            errors.append("Missing back cover prompt (sub-heading 'ضهر الغلاف'/'back' with a code block)")
         if not sample_prompt:
-            errors.append("Missing colored-sample prompt (no code block found)")
+            errors.append("Missing colored-sample prompt (sub-heading 'عينات'/'sample' with a code block)")
 
     # ── 4. KDP form fields ────────────────────────────────────────────────────
-    # Accept several possible heading names for the details section
-    det = _section(text, "kdp details", "kdp listing", "listing details",
-                   "book details", "publication details", "details", "kdp")
-    detail_text = det if det else text  # fall back to full doc
+    det = _section(
+        text, "فورم", "paperback details", "kdp details", "kdp listing", "listing details",
+        "book details", "publication details", max_level=2,
+    )
+    detail_text = det if det is not None else text
+    table = _table_rows(detail_text)
 
-    language        = _field(detail_text, r"language") or "English"
-    book_title      = _field(detail_text, r"book\s*title")
-    subtitle        = _field(detail_text, r"subtitle")
-    series          = _field(detail_text, r"series")
-    edition         = _field(detail_text, r"edition\s*(?:number)?")
-    author          = _field(detail_text, r"author")
-    contributors    = _field(detail_text, r"contributors?")
-    pub_rights      = _field(detail_text, r"publishing\s*rights?", r"rights")
-    sexually_exp    = _field(detail_text, r"sexually\s*explicit") or "No"
-    marketplace     = _field(detail_text, r"primary\s*marketplace", r"marketplace")
-    low_content     = _field(detail_text, r"low.?content|large.?print")
-    pub_date        = _field(detail_text, r"publication\s*date")
-    release_date    = _field(detail_text, r"release\s*date")
-    pricing         = _field(detail_text, r"pric(?:e|ing)")
-    pricing_notes   = _field(detail_text, r"pricing\s*note")
+    language = _get(table, detail_text, ("language",), (r"language",)) or "English"
+    book_title = _get(table, detail_text, ("book title",), (r"book\s*title",))
+    subtitle = _get(table, detail_text, ("subtitle",), (r"subtitle",))
+    series = _get(table, detail_text, ("series",), (r"series",))
+    edition = _get(table, detail_text, ("edition",), (r"edition\s*(?:number)?",))
+    author = _get(table, detail_text, ("author",), (r"author",))
+    contributors = _get(table, detail_text, ("contributor",), (r"contributors?",))
+    pub_rights = _get(table, detail_text, ("publishing rights",), (r"publishing\s*rights?",))
+    sexually_exp = _get(table, detail_text, ("sexually explicit",), (r"sexually\s*explicit",)) or "No"
+    marketplace = _get(table, detail_text, ("primary marketplace",),
+                       (r"primary\s*marketplace", r"marketplace"))
+    low_content = _get(table, detail_text, ("low-content", "low content", "low_content"),
+                       (r"low.?content|large.?print",))
+    pub_date = _get(table, detail_text, ("publication date",), (r"publication\s*date",))
+    release_date = _get(table, detail_text, ("release date",), (r"release\s*date",))
 
-    # Reading age: "3-8", "min: 3  max: 8", etc.
-    age_raw = _field(detail_text, r"reading\s*age")
-    age_m   = re.search(r"(\d+)\s*[-–to]\s*(\d+)", age_raw)
-    if age_m:
-        age_min, age_max = age_m.group(1), age_m.group(2)
-    else:
-        age_min = _field(detail_text, r"reading\s*age\s*\(?min\)?", r"age\s*min")
-        age_max = _field(detail_text, r"reading\s*age\s*\(?max\)?", r"age\s*max")
+    # Reading age: "Min 1 / Max 3 (...)", "3-8", "3 to 8"
+    age_raw = _get(table, detail_text, ("reading age",), (r"reading\s*age",))
+    age_min = age_max = ""
+    m_mm = re.search(r"min\D*(\d+).*?max\D*(\d+)", age_raw, re.IGNORECASE)
+    m_rng = re.search(r"(\d+)\s*(?:-|–|—|to)\s*(\d+)", age_raw, re.IGNORECASE)
+    if m_mm:
+        age_min, age_max = m_mm.group(1), m_mm.group(2)
+    elif m_rng:
+        age_min, age_max = m_rng.group(1), m_rng.group(2)
 
-    # Description: prefer a code block inside a 'Description' sub-section
-    desc_sec  = _section(detail_text, "description")
-    if desc_sec:
-        description = _code_block(desc_sec) or desc_sec.strip()
-    else:
-        # Grab first code block in the detail section
-        cb = _code_block(detail_text)
-        description = cb or ""
+    # Description: first code block inside a 'Description' sub-section
+    desc_sec = _section(detail_text, "description", min_level=2)
+    description = (_code_block(desc_sec) or desc_sec.strip()) if desc_sec else ""
 
     # Keywords: numbered list inside a 'Keywords' sub-section
-    kw_sec = _section(detail_text, "keywords?", "keyword")
-    if kw_sec:
-        kws = re.findall(r"^\s*\d+[.)]\s+(.+)$", kw_sec, re.MULTILINE)
-        keywords = [k.strip() for k in kws if k.strip()]
-    else:
-        keywords = []
+    kw_sec = _section(detail_text, "keyword", min_level=2)
+    keywords = [_strip_ticks(t) for _n, t in _numbered_items(kw_sec)] if kw_sec else []
+    keywords = [k for k in keywords if k]
 
-    # Categories: bullet list inside a 'Categories' sub-section
-    cat_sec = _section(detail_text, "categor")
+    # Categories: bullet (or numbered) list inside a 'Categories' sub-section
+    cat_sec = _section(detail_text, "categor", "تصنيف", min_level=2)
+    categories: list[str] = []
     if cat_sec:
-        cats = re.findall(r"^\s*[-•*]\s+(.+)$", cat_sec, re.MULTILINE)
+        cats = re.findall(r"^[ \t]*[-•*][ \t]+(.+?)[ \t]*$", cat_sec, re.MULTILINE)
         if not cats:
-            cats = re.findall(r"^\s*\d+[.)]\s+(.+)$", cat_sec, re.MULTILINE)
-        categories = [c.strip() for c in cats if c.strip()]
-    else:
-        categories = []
+            cats = [t for _n, t in _numbered_items(cat_sec)]
+        for c in cats:
+            c = _strip_ticks(c)
+            if re.match(r"^\((?:اختياري|optional)", c, re.IGNORECASE):
+                continue  # optional hint line, not a real category
+            # drop trailing Arabic parenthetical notes, e.g. "(أو أقرب مسار)"
+            c = re.sub(r"\s*\([^)]*\)\s*$", lambda mm: "" if _ARABIC_RE.search(mm.group(0)) else mm.group(0), c)
+            c = c.strip()
+            if c:
+                categories.append(c)
 
-    # Print settings
-    paper         = _field(detail_text, r"paper") or "White"
-    interior      = _field(detail_text, r"interior") or "Black & White Standard"
-    trim          = _field(detail_text, r"trim\s*(?:size)?") or "8.5 x 11 in"
-    bleed         = _field(detail_text, r"bleed") or "No bleed"
-    cover_finish  = _field(detail_text, r"cover\s*finish") or "Matte"
+    # ── Content / print settings (separate section; values may share one line) ──
+    content_sec = _section(text, "paperback content", "إعدادات", "print settings", max_level=2) or ""
+    search_in = content_sec if content_sec else detail_text
+    paper = _inline(search_in, "Paper") or _field(detail_text, r"paper") or "White"
+    interior = _inline(search_in, "Interior") or _field(detail_text, r"interior") or "Black & White Standard"
+    trim = _inline(search_in, "Trim") or _field(detail_text, r"trim\s*(?:size)?") or "8.5 x 11 in"
+    bleed = _inline(search_in, "Bleed") or _field(detail_text, r"bleed") or "No bleed"
+    cover_finish = (_inline(search_in, "Cover finish") or _field(detail_text, r"cover\s*finish")
+                    or "Matte")
+
+    # ── Pricing ──────────────────────────────────────────────────────────────
+    price_sec = _section(text, "التسعير", "pricing", "price", max_level=2) or ""
+    pricing = ""
+    pricing_notes = ""
+    if price_sec.strip():
+        pr = re.search(r"\d+(?:\.\d+)?\s*\$?\s*[–\-—]\s*\d+(?:\.\d+)?\s*\$?", price_sec)
+        pricing = pr.group(0).strip() if pr else ""
+        bullets = re.findall(r"^[ \t]*[-•*][ \t]+(.+?)[ \t]*$", price_sec, re.MULTILINE)
+        pricing_notes = " ".join(bullets) if bullets else price_sec.strip()
+    else:
+        pricing = _field(detail_text, r"pric(?:e|ing)")
+        pricing_notes = _field(detail_text, r"pricing\s*note")
 
     # ── 5. Collect errors ─────────────────────────────────────────────────────
     if not book_title:
-        errors.append("Field not found: 'Book Title'")
-    if not page_ideas:
-        errors.append("No page ideas found — cannot continue")
+        h1 = re.search(r"^#[ \t]+(.+?)[ \t]*$", text, re.MULTILINE)
+        if h1:
+            book_title = h1.group(1).strip()
+        else:
+            errors.append("Field not found: 'Book Title' (table row 'Book Title' in the KDP form section)")
+    if not keywords:
+        errors.append("No keywords found (numbered list under a 'Keywords' sub-heading)")
 
     if errors:
+        found = "\n".join(f"    {h}" for h in _heading_titles(text)) or "    (none)"
         raise ValueError(
             "Could not fully parse the Markdown file. Issues found:\n"
             + "\n".join(f"  • {e}" for e in errors)
+            + "\n  Headings found in the file:\n"
+            + found
         )
 
     return KDPBook(
@@ -279,8 +410,8 @@ def parse_book(md_path: Path) -> KDPBook:
         contributors=contributors,
         publishing_rights=pub_rights,
         sexually_explicit=sexually_exp,
-        reading_age_min=str(age_min) if age_min else "",
-        reading_age_max=str(age_max) if age_max else "",
+        reading_age_min=age_min,
+        reading_age_max=age_max,
         primary_marketplace=marketplace,
         low_content_notes=low_content,
         publication_date=pub_date,
@@ -296,3 +427,14 @@ def parse_book(md_path: Path) -> KDPBook:
         pricing=pricing,
         pricing_notes=pricing_notes,
     )
+
+
+if __name__ == "__main__":  # quick manual check: python parser.py path\to\book.md
+    import sys
+
+    b = parse_book(Path(sys.argv[1]))
+    print("Title:", b.book_title)
+    print("Subtitle:", b.subtitle)
+    print("Ideas:", len(b.page_ideas), "| Keywords:", len(b.keywords), "| Categories:", len(b.categories))
+    print("Reading age:", b.reading_age_min, "-", b.reading_age_max)
+    print("Covers:", bool(b.front_cover_prompt), bool(b.back_cover_prompt), bool(b.colored_sample_prompt))

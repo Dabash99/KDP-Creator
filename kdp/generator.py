@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -23,8 +24,15 @@ _QA_CORRECTIONS: dict[str, str] = {
 }
 
 
-def _decode(b64: str, dest: Path) -> None:
-    dest.write_bytes(base64.b64decode(b64))
+def _save_image(item, dest: Path) -> None:
+    """Save one image response item — prefers b64_json, falls back to url."""
+    if getattr(item, "b64_json", None):
+        dest.write_bytes(base64.b64decode(item.b64_json))
+    elif getattr(item, "url", None):
+        with urllib.request.urlopen(item.url) as r:
+            dest.write_bytes(r.read())
+    else:
+        raise RuntimeError("API response has neither b64_json nor url")
 
 
 # ── Image generation ──────────────────────────────────────────────────────────
@@ -74,9 +82,8 @@ class ImageGenerator:
                 size=self.size,
                 quality=self.quality,
                 n=1,
-                response_format="b64_json",
             )
-            _decode(resp.data[0].b64_json, dest)
+            _save_image(resp.data[0], dest)
 
         try:
             _call()
@@ -107,9 +114,8 @@ class ImageGenerator:
                     size=self.size,
                     quality=self.quality,
                     n=1,
-                    response_format="b64_json",
                 )
-            _decode(resp.data[0].b64_json, dest)
+            _save_image(resp.data[0], dest)
 
         try:
             _call()

@@ -355,6 +355,16 @@ def run(argv: list[str] | None = None) -> None:
 
         save_manifest(book_dir / "manifest.json", manifest)
 
+        # Abort PDF build if any page hard-failed (needs_review is OK — image exists)
+        failed_pages = [
+            k for k, p in manifest["pages"].items() if p.get("status") == "failed"
+        ]
+        if failed_pages:
+            _write_qa_report(book_dir, manifest)
+            print(f"\n✗ {len(failed_pages)} page(s) failed to generate: {', '.join(failed_pages)}")
+            print("  Fix the error above and re-run — resume mode will skip successful pages.")
+            sys.exit(1)
+
         # ── F. Covers ─────────────────────────────────────────────────────
         if not args.skip_cover:
             print("\n[F] Generating covers ...\n")

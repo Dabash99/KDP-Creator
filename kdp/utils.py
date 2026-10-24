@@ -76,6 +76,14 @@ def setup_logger(log_path: Path) -> logging.Logger:
 _RETRYABLE = ("rate limit", "429", "500", "502", "503", "504", "timeout",
               "connection error", "read timed out", "server error")
 
+_STATUS_RE = re.compile(r'\b([45]\d{2})\b')
+
+
+def _http_status(exc: Exception) -> int | None:
+    """Extract the first HTTP status code from an exception's string representation."""
+    m = _STATUS_RE.search(str(exc))
+    return int(m.group(1)) if m else None
+
 
 def retry_with_backoff(max_attempts: int = 4, base_delay: float = 2.0) -> Callable[[F], F]:
     def decorator(func: F) -> F:
@@ -87,11 +95,18 @@ def retry_with_backoff(max_attempts: int = 4, base_delay: float = 2.0) -> Callab
                     return func(*args, **kwargs)
                 except Exception as exc:
                     last_exc = exc
+                    status = _http_status(exc)
+                    # 4xx errors other than 429 are client errors — fail immediately,
+                    # retrying will not help and wastes quota.
+                    if status and 400 <= status < 500 and status != 429:
+                        logging.getLogger("kdp").error(
+                            "API client error %s (not retrying): %s", status, exc
+                        )
+                        raise
                     low = str(exc).lower()
                     if any(t in low for t in _RETRYABLE) and attempt < max_attempts - 1:
                         delay = base_delay * (2 ** attempt)
-                        log = logging.getLogger("kdp")
-                        log.warning(
+                        logging.getLogger("kdp").warning(
                             "API error attempt %d/%d: %s  — retrying in %.1fs",
                             attempt + 1, max_attempts, exc, delay,
                         )
